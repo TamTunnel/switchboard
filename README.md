@@ -38,12 +38,15 @@ can implement, instead of another walled workspace that owns your handoffs.
 ```sh
 git clone https://github.com/TamTunnel/switchboard
 cd switchboard
-go build -o /usr/local/bin/switchboard ./cmd/switchboard
-go build -o /usr/local/bin/sb ./cmd/sb
-go build -o /usr/local/bin/sb-adapter ./cmd/sb-adapter
+CGO_ENABLED=0 go build -o /usr/local/bin/switchboard ./cmd/switchboard
+CGO_ENABLED=0 go build -o /usr/local/bin/sb ./cmd/sb
+CGO_ENABLED=0 go build -o /usr/local/bin/sb-adapter ./cmd/sb-adapter
 ```
 
 Go 1.23+ required. The three binaries are static — no runtime to install.
+The commands pin CGO_ENABLED=0 because the daemon and CLI import `net`,
+whose cgo resolver would otherwise dynamically link a default build; `sb`
+also deliberately avoids os/user so no first-party code needs cgo at all.
 
 ### Run
 
@@ -152,7 +155,11 @@ you get a clear error telling you to start it.
 **What happens when an agent fails or hangs?**
 Timeout (default 10 minutes, per-task override via `--timeout`), then one
 retry, then the envelope goes to the dead-letter queue (`dead/`) with the
-error attached. Nothing is silently dropped.
+error attached. Nothing is silently dropped. If the daemon itself restarts
+mid-task, in-flight envelopes are requeued with their attempt count
+preserved, so a retry survives a restart. On shutdown the daemon waits
+(bounded) for in-flight dispatches, so their adapter processes are killed
+with the run instead of orphaned.
 
 **Is my data sent anywhere?**
 No. Everything is local: Unix socket, local files, local agent CLIs. There
@@ -170,7 +177,9 @@ as trusted system instructions**. See `docs/adapter-protocol.md` § Security.
 
 **Why Go?**
 A single static binary (~14MB class) with no runtime for the user to
-install, stdlib-first. The daemon is I/O-bound supervision work, not a hot
+install, stdlib-first for the runtime paths. The only third-party
+dependencies are cobra (CLI), yaml.v3 (config), and jsonschema (envelope
+schema validation). The daemon is I/O-bound supervision work, not a hot
 loop — nothing here justifies a heavier stack.
 
 ## Repository best practices

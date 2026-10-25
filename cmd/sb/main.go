@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/TamTunnel/switchboard/internal/client"
+	"github.com/TamTunnel/switchboard/internal/config"
 	"github.com/TamTunnel/switchboard/internal/daemon"
 	"github.com/TamTunnel/switchboard/internal/envelope"
 )
@@ -34,12 +34,15 @@ func homeDir(flag string) string {
 	return filepath.Join(home, ".switchboard")
 }
 
+// defaultAgent resolves the sender name without cgo: $SWITCHBOARD_AGENT,
+// then $USER, then "cli". (os/user pulls in cgo and would make the sb
+// binary dynamically linked; the project claims static binaries.)
 func defaultAgent() string {
 	if v := os.Getenv("SWITCHBOARD_AGENT"); v != "" {
 		return v
 	}
-	if u, err := user.Current(); err == nil && u.Username != "" {
-		return u.Username
+	if v := os.Getenv("USER"); v != "" {
+		return v
 	}
 	return "cli"
 }
@@ -60,6 +63,15 @@ func main() {
 			instr, _ := cmd.Flags().GetString("instructions")
 			instrFile, _ := cmd.Flags().GetString("instructions-file")
 			from, _ := cmd.Flags().GetString("from")
+			// config.yaml's default_agent is the sender fallback when the
+			// user did not pass --from and $SWITCHBOARD_AGENT is unset.
+			// (The --from flag default already reflects $SWITCHBOARD_AGENT
+			// or $USER; an explicit --from always wins.)
+			if !cmd.Flags().Changed("from") && os.Getenv("SWITCHBOARD_AGENT") == "" {
+				if cfg, err := config.Load(config.Path(homeDir(homeFlag))); err == nil && cfg.DefaultAgent != "" {
+					from = cfg.DefaultAgent
+				}
+			}
 			shape, _ := cmd.Flags().GetString("shape")
 			timeout, _ := cmd.Flags().GetInt("timeout")
 			workspace, _ := cmd.Flags().GetString("workspace")
@@ -77,6 +89,15 @@ func main() {
 			case envelope.ShapeDelegate, envelope.ShapePipeline, envelope.ShapeReview:
 			default:
 				return fmt.Errorf("unknown --shape %q (delegate|pipeline|review)", shape)
+			}
+			// Shape/flag mismatches are rejected here, not silently
+			// accepted: --next only advances a pipeline, and --diff-file
+			// only feeds a review.
+			if shape != envelope.ShapePipeline && len(next) > 0 {
+				return fmt.Errorf("--next only applies to --shape pipeline (shape is %q)", shape)
+			}
+			if shape != envelope.ShapeReview && diffFile != "" {
+				return fmt.Errorf("--diff-file only applies to --shape review (shape is %q)", shape)
 			}
 			if instrFile != "" {
 				data, err := os.ReadFile(instrFile)

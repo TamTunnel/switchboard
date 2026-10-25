@@ -30,6 +30,12 @@ func Serve(agent string, capabilities []string, run RunFunc) int {
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			// A scanner error (e.g. a run request line over the 1MB token
+			// limit) is a loud failure, not a silent empty run.
+			emit(ErrorMsg{Type: MsgError, Message: "run request unreadable: " + err.Error()})
+			return 1
+		}
 		emit(ErrorMsg{Type: MsgError, Message: "no run request (stdin closed)"})
 		return 1
 	}
@@ -52,23 +58,72 @@ func Serve(agent string, capabilities []string, run RunFunc) int {
 
 // --- Shared agent-CLI helpers ---
 
+// agentLine is one parsed line of agent-CLI output. At most one of the
+// result/error signals is set; progress text is advisory.
+type agentLine struct {
+	progress   string
+	isResult   bool
+	resultText string
+	isError    bool
+	errorText  string
+}
+
 // parseAgentLine best-effort parses one JSON line from an agent CLI's
-// streaming output. It returns progress text, and (isResult, resultText) when
-// the line is a terminal result. Lines that are not JSON or carry no usable
-// text return empty strings; the caller accumulates raw output for fallback.
-func parseAgentLine(line []byte) (progress string, isResult bool, resultText string) {
+// streaming output. Lines that are not JSON or carry no usable text return
+// the zero value; the caller accumulates raw output for fallback.
+//
+// Supported shapes:
+//   - Generic: {"type":"result",...} is a terminal result.
+//   - Claude-style: {"message": {"content": [{"type": "text", ...}]}}.
+//   - Codex exec --json: {"type":"item.completed","item":{"type":
+//     "agent_message","text":...}} is the terminal result (last one wins),
+//     {"type":"item.completed","item":{"type":"reasoning",...}} is progress,
+//     and {"type":"turn.failed",...} is a terminal ERROR — never a degraded
+//     success, even when the CLI exits 0.
+func parseAgentLine(line []byte) agentLine {
 	var m map[string]any
 	if err := json.Unmarshal(line, &m); err != nil {
-		return "", false, ""
+		return agentLine{}
 	}
 	typ, _ := m["type"].(string)
 	if typ == "result" {
 		for _, k := range []string{"result", "text", "output"} {
 			if s, ok := m[k].(string); ok && s != "" {
-				return "", true, s
+				return agentLine{isResult: true, resultText: s}
 			}
 		}
-		return "", true, ""
+		return agentLine{isResult: true}
+	}
+	// Codex exec --json events.
+	if typ == "item.completed" {
+		if item, ok := m["item"].(map[string]any); ok {
+			switch item["type"] {
+			case "agent_message":
+				if s, ok := item["text"].(string); ok && s != "" {
+					return agentLine{isResult: true, resultText: s}
+				}
+				return agentLine{isResult: true}
+			case "reasoning":
+				if s, ok := item["text"].(string); ok && s != "" {
+					return agentLine{progress: s}
+				}
+			}
+		}
+		return agentLine{}
+	}
+	if typ == "turn.failed" {
+		msg := "turn failed"
+		switch e := m["error"].(type) {
+		case map[string]any:
+			if s, ok := e["message"].(string); ok && s != "" {
+				msg = s
+			}
+		case string:
+			if e != "" {
+				msg = e
+			}
+		}
+		return agentLine{isError: true, errorText: msg}
 	}
 	// Claude-style: {"message": {"content": [{"type": "text", "text": "..."}]}}
 	if msg, ok := m["message"].(map[string]any); ok {
@@ -84,14 +139,14 @@ func parseAgentLine(line []byte) (progress string, isResult bool, resultText str
 				}
 			}
 			if len(parts) > 0 {
-				return joinStrings(parts, ""), false, ""
+				return agentLine{progress: joinStrings(parts, "")}
 			}
 		}
 	}
 	if s, ok := m["text"].(string); ok && s != "" {
-		return s, false, ""
+		return agentLine{progress: s}
 	}
-	return "", false, ""
+	return agentLine{}
 }
 
 func joinStrings(parts []string, sep string) string {

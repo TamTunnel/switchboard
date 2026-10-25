@@ -32,7 +32,7 @@ adapter exits (0 on result, non-zero on error)
 | `type` | Always `"hello"`. |
 | `protocol` | Protocol version. Must be `"sb/1"` in v1. |
 | `agent` | Agent name this adapter serves (e.g. `"claude"`). |
-| `capabilities` | Simple tags for `cap:` routing (e.g. `"code"`, `"review"`). |
+| `capabilities` | Simple tags for `cap:` routing (e.g. `"code"`, `"review"`). Informational in v1: routing uses the daemon's `config.yaml` capabilities, not what the adapter declares on hello. Adapters should still declare them accurately; a future version may enforce consistency. |
 
 A protocol mismatch **fails loudly**: the daemon kills the adapter, does not
 run the envelope, and dead-letters it. There is no silent fallback to a
@@ -112,7 +112,7 @@ protocol with its own hello negotiation — never a silent extension.
 |---|---|---|---|
 | echo | — (built in) | structured | Reference adapter. Used by all integration tests. |
 | claude | `claude -p --output-format stream-json [--resume <id>] <prompt>` | Structured `stream-json` parsing; raw-text fallback on parse failure | Implemented against Claude Code's documented flags. Not live-tested here (no Claude Code CLI in the build environment); unit-tested against scripted stand-ins emitting the documented format. |
-| codex | `codex exec --json <prompt>` | Best-effort JSON parsing; raw-text fallback | Same honesty note as claude: documented flags, scripted stand-ins, no live CLI in this environment. |
+| codex | `codex exec --json --skip-git-repo-check --sandbox workspace-write <prompt>` | Structured `codex exec --json` parsing (thread/item/turn events): `item.completed` + `agent_message` is the result, `turn.failed` is an error (never a degraded success); raw-text fallback on parse failure | Implemented against Codex's documented flags. Not live-tested here (no Codex CLI in the build environment); unit-tested against scripted stand-ins emitting the documented format. |
 | opencode | `opencode run <prompt>` | Plain text (no stable JSON mode pinned) | Provisional. If OpenCode gains a stable JSON streaming mode, pin it here and upgrade the parser. |
 
 Override the CLI binary per adapter with `SB_CLAUDE_BIN`, `SB_CODEX_BIN`,

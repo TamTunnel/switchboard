@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/TamTunnel/switchboard/internal/envelope"
@@ -83,6 +84,51 @@ func TestLogs(t *testing.T) {
 	got, err := st.ReadLog(id)
 	if err != nil || got != "hello\nworld\n" {
 		t.Fatalf("log mismatch: %q err %v", got, err)
+	}
+}
+
+func TestInvalidIDsRejected(t *testing.T) {
+	st := testStore(t)
+	for _, id := range []string{"../evil", "a/b", "", "not-a-ulid", "01AAAAAAAAAAAAAAAAAAAAAAA/"} {
+		env := testEnv()
+		env.ID = id
+		if err := st.Write(env); err == nil {
+			t.Fatalf("Write accepted bad id %q", id)
+		}
+		if err := st.Move(env, envelope.StatusClaimed); err == nil {
+			t.Fatalf("Move accepted bad id %q", id)
+		}
+		if _, err := st.Read(DirPending, id); err == nil {
+			t.Fatalf("Read accepted bad id %q", id)
+		}
+		if err := st.AppendLog(id, "x"); err == nil {
+			t.Fatalf("AppendLog accepted bad id %q", id)
+		}
+		if _, err := st.ReadLog(id); err == nil {
+			t.Fatalf("ReadLog accepted bad id %q", id)
+		}
+	}
+	// Nothing escaped the store root via traversal.
+	if _, err := os.Stat(filepath.Join(filepath.Dir(st.Root()), "evil.json")); !os.IsNotExist(err) {
+		t.Fatal("traversal file created outside store root")
+	}
+}
+
+func TestAppendLogCapped(t *testing.T) {
+	st := testStore(t)
+	id := "01AAAAAAAAAAAAAAAAAAAAAAAA"
+	line := strings.Repeat("l", 1<<20) // 1MB lines
+	for i := 0; i < 12; i++ {
+		if err := st.AppendLog(id, line); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fi, err := os.Stat(filepath.Join(st.Root(), DirLogs, id+".log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() > (10<<20)+(1<<20) {
+		t.Fatalf("log not capped: %d bytes after 12MB appended", fi.Size())
 	}
 }
 

@@ -1,7 +1,10 @@
 // Package store implements the maildir-style envelope store. Envelopes are JSON
 // files in <root>/{pending,claimed,done,dead}/, named <id>.json. The daemon
-// is the sole writer; the CLI reads. Writes are atomic (temp file + rename)
-// and status transitions are file renames, so a crash never leaves a torn file.
+// is the sole writer; the CLI reads. Writes are atomic (temp file + rename
+// within a directory). Status transitions are write-new-then-delete-old:
+// the envelope's Status field changes, so the content must be rewritten in
+// the new directory and the old file removed — they are NOT plain renames.
+// Same-directory status updates (e.g. claimed -> running) overwrite in place.
 package store
 
 import (
@@ -13,6 +16,10 @@ import (
 
 	"github.com/TamTunnel/switchboard/internal/envelope"
 )
+
+// maxLogBytes caps one envelope's run log. Past the cap, AppendLog drops
+// further lines instead of growing the file without bound.
+const maxLogBytes = 10 << 20
 
 // Dir names mirror envelope statuses that persist on disk. "running" envelopes
 // live in claimed/ with Status=running; "failed" is transient (retry or dead).
@@ -66,8 +73,20 @@ func (s *Store) path(dir, id string) string {
 	return filepath.Join(s.root, dir, id+".json")
 }
 
+// checkID rejects ids that are not ULIDs. Store paths are built from ids, so
+// a crafted id (e.g. containing ../) must never reach the filesystem.
+func checkID(id string) error {
+	if !envelope.ValidID(id) {
+		return fmt.Errorf("store: invalid envelope id %q", id)
+	}
+	return nil
+}
+
 // Write persists env into the directory for its status, atomically.
 func (s *Store) Write(env *envelope.Envelope) error {
+	if err := checkID(env.ID); err != nil {
+		return err
+	}
 	env.Touch()
 	data, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
@@ -95,8 +114,14 @@ func (s *Store) Write(env *envelope.Envelope) error {
 	return os.Rename(tmpName, s.path(DirFor(env.Status), env.ID))
 }
 
-// Move transitions env to a new status directory, updating Status first.
+// Move transitions env to a new status directory. It computes the old
+// directory from env's CURRENT status, then sets Status — callers must NOT
+// mutate env.Status before calling Move, or the old file is never removed
+// and the envelope exists in two directories at once.
 func (s *Store) Move(env *envelope.Envelope, newStatus string) error {
+	if err := checkID(env.ID); err != nil {
+		return err
+	}
 	oldDir := DirFor(env.Status)
 	oldPath := s.path(oldDir, env.ID)
 	env.Status = newStatus
@@ -114,6 +139,9 @@ func (s *Store) Move(env *envelope.Envelope, newStatus string) error {
 
 // Read loads one envelope from a specific directory.
 func (s *Store) Read(dir, id string) (*envelope.Envelope, error) {
+	if err := checkID(id); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(s.path(dir, id))
 	if err != nil {
 		return nil, err
@@ -160,9 +188,18 @@ func (s *Store) List(dir string) ([]*envelope.Envelope, error) {
 	return out, nil
 }
 
-// AppendLog appends a line to an envelope's run log.
+// AppendLog appends a line to an envelope's run log. Once the log reaches
+// maxLogBytes, further lines are dropped: the envelope still completes, but
+// the log file cannot grow without bound.
 func (s *Store) AppendLog(id, line string) error {
-	f, err := os.OpenFile(filepath.Join(s.root, DirLogs, id+".log"),
+	if err := checkID(id); err != nil {
+		return err
+	}
+	p := filepath.Join(s.root, DirLogs, id+".log")
+	if st, err := os.Stat(p); err == nil && st.Size() >= maxLogBytes {
+		return nil
+	}
+	f, err := os.OpenFile(p,
 		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -174,6 +211,9 @@ func (s *Store) AppendLog(id, line string) error {
 
 // ReadLog returns an envelope's run log, or "" if none exists.
 func (s *Store) ReadLog(id string) (string, error) {
+	if err := checkID(id); err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(filepath.Join(s.root, DirLogs, id+".log"))
 	if err != nil {
 		if os.IsNotExist(err) {

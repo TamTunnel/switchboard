@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -102,6 +103,14 @@ type Envelope struct {
 	CreatedAt  string  `json:"created_at,omitempty"`
 	UpdatedAt  string  `json:"updated_at,omitempty"`
 }
+
+// ulidPattern mirrors the "id" pattern in the sb/1 JSON Schema. Store paths
+// are built from ids, so ValidID is the traversal guard: anything that is
+// not a ULID must never reach a filesystem path.
+var ulidPattern = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{26}$`)
+
+// ValidID reports whether id is a well-formed ULID.
+func ValidID(id string) bool { return ulidPattern.MatchString(id) }
 
 // New creates a task envelope with a fresh ULID id. The caller fills To/Task.
 func New(from, to, shape string) *Envelope {

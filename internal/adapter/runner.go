@@ -12,7 +12,8 @@
 //  5. Adapter exits. A non-zero exit without a result line is a failure.
 //
 // The protocol version is checked on hello; a mismatch fails loudly and the
-// envelope is dead-lettered, never silently run against the wrong contract.
+// envelope is dead-lettered without a retry, never silently run against the
+// wrong contract.
 // Unparseable stdout lines are treated as progress text (graceful degradation
 // to plain text), and an adapter that exits 0 with text but no result line
 // yields a degraded result whose summary is that text.
@@ -22,6 +23,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -30,6 +32,29 @@ import (
 
 	"github.com/TamTunnel/switchboard/internal/envelope"
 )
+
+// maxAccumulatedBytes caps text the runner accumulates from one adapter run
+// (progress text and unparseable lines). Past the cap, further text is
+// dropped with a truncation marker instead of growing memory without bound.
+const maxAccumulatedBytes = 1 << 20
+
+// ErrProtocolMismatch marks a hello whose protocol version is not sb/1.
+// The daemon matches it with errors.Is to skip the retry: a version mismatch
+// is deterministic, retrying against the same adapter cannot succeed.
+var ErrProtocolMismatch = errors.New("adapter: protocol mismatch")
+
+// appendCapped appends s to b until maxAccumulatedBytes, then appends a
+// truncation marker once and drops the rest.
+func appendCapped(b *strings.Builder, truncated *bool, s string) {
+	if b.Len() >= maxAccumulatedBytes {
+		return
+	}
+	b.WriteString(s)
+	if b.Len() >= maxAccumulatedBytes && !*truncated {
+		b.WriteString("\n…[truncated: output exceeded 1MB]\n")
+		*truncated = true
+	}
+}
 
 // ProtocolVersion is the adapter protocol version. It matches the envelope
 // version in v1 by design; a future protocol bump is a loud break, not a
@@ -133,19 +158,29 @@ func (r *Runner) Run(ctx context.Context, env *envelope.Envelope) (*Result, erro
 		return nil, fmt.Errorf("adapter: start %v: %w", r.Command, err)
 	}
 	// Kill the whole process group on context expiry (CommandContext only
-	// kills the direct child).
+	// kills the direct child). The killDone guard stops the goroutine from
+	// firing after a normal completion, when the pid may already be reaped.
+	killDone := make(chan struct{})
+	defer close(killDone)
 	go func() {
-		<-runCtx.Done()
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		select {
+		case <-runCtx.Done():
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		case <-killDone:
 		}
 	}()
 	// Drain stderr to progress so agent CLI diagnostics land in the run log.
+	// A scanner error (e.g. a >1MB stderr line) is reported, not swallowed.
 	go func() {
 		sc := bufio.NewScanner(stderr)
 		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 		for sc.Scan() {
 			r.progress("stderr: " + sc.Text())
+		}
+		if err := sc.Err(); err != nil {
+			r.progress("stderr: scanner error: " + err.Error())
 		}
 	}()
 
@@ -162,10 +197,12 @@ func (r *Runner) Run(ctx context.Context, env *envelope.Envelope) (*Result, erro
 		_ = cmd.Wait()
 		return nil, fmt.Errorf("adapter: bad hello line: %s", strings.TrimSpace(sc.Text()))
 	}
+	// Capabilities on hello are informational in v1: routing uses the
+	// daemon's config.yaml, not what the adapter declares here.
 	if hello.Protocol != ProtocolVersion {
 		_ = cmd.Wait()
-		return nil, fmt.Errorf("adapter: protocol mismatch: adapter speaks %q, daemon expects %q (failing loudly, not running)",
-			hello.Protocol, ProtocolVersion)
+		return nil, fmt.Errorf("%w: adapter speaks %q, daemon expects %q (failing loudly, not running)",
+			ErrProtocolMismatch, hello.Protocol, ProtocolVersion)
 	}
 
 	// 2. Send the run request, then close stdin (adapters read one line).
@@ -179,6 +216,7 @@ func (r *Runner) Run(ctx context.Context, env *envelope.Envelope) (*Result, erro
 	// 3. Consume the stream until result, error, or EOF.
 	var result *ResultMsg
 	var textBuf strings.Builder
+	textTruncated := false
 	for sc.Scan() {
 		line := sc.Bytes()
 		if len(line) == 0 {
@@ -189,8 +227,7 @@ func (r *Runner) Run(ctx context.Context, env *envelope.Envelope) (*Result, erro
 		}
 		if err := json.Unmarshal(line, &wire); err != nil {
 			// Graceful degradation: unparseable line becomes progress text.
-			textBuf.WriteString(string(line))
-			textBuf.WriteString("\n")
+			appendCapped(&textBuf, &textTruncated, string(line)+"\n")
 			r.progress(string(line))
 			continue
 		}
@@ -199,8 +236,7 @@ func (r *Runner) Run(ctx context.Context, env *envelope.Envelope) (*Result, erro
 			var p Progress
 			if err := json.Unmarshal(line, &p); err == nil {
 				r.progress(p.Text)
-				textBuf.WriteString(p.Text)
-				textBuf.WriteString("\n")
+				appendCapped(&textBuf, &textTruncated, p.Text+"\n")
 			}
 		case MsgResult:
 			var res ResultMsg
@@ -220,9 +256,15 @@ func (r *Runner) Run(ctx context.Context, env *envelope.Envelope) (*Result, erro
 		default:
 			// Unknown message type: log as text, keep going.
 			r.progress(string(line))
-			textBuf.WriteString(string(line))
-			textBuf.WriteString("\n")
+			appendCapped(&textBuf, &textTruncated, string(line)+"\n")
 		}
+	}
+	// A scanner error (e.g. a line over the 1MB token limit) means the
+	// stream is incomplete: fail loudly instead of returning a partial
+	// result as if the run had succeeded.
+	if err := sc.Err(); err != nil {
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("adapter: reading output: %w", err)
 	}
 	waitErr := cmd.Wait()
 	if result != nil {

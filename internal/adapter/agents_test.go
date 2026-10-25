@@ -82,6 +82,65 @@ echo '{"type":"result","text":"Codex did the thing"}'
 	}
 }
 
+func TestCodexRunRealExecJSONShapes(t *testing.T) {
+	// Real `codex exec --json` event shapes (documented stream):
+	// thread.started, turn.started, item.completed/agent_message, turn.completed.
+	cli := fakeCLI(t, `
+echo '{"type":"thread.started","thread_id":"thread_123"}'
+echo '{"type":"turn.started"}'
+echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Implemented rate limiting"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":50}}'
+`)
+	t.Setenv("SB_CODEX_BIN", cli)
+	res, err := CodexRun(cliEnv(), func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Summary != "Implemented rate limiting" || res.Degraded {
+		t.Fatalf("expected structured codex result, got %+v", res)
+	}
+}
+
+func TestCodexRunTurnFailedIsError(t *testing.T) {
+	// A turn.failed run must be an error even when the CLI exits 0:
+	// previously it degraded to a "successful" raw-text result.
+	cli := fakeCLI(t, `
+echo '{"type":"thread.started","thread_id":"thread_123"}'
+echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"partial work"}}'
+echo '{"type":"turn.failed","error":{"message":"sandbox denied write outside workspace"}}'
+`)
+	t.Setenv("SB_CODEX_BIN", cli)
+	if _, err := CodexRun(cliEnv(), func(string) {}); err == nil || !strings.Contains(err.Error(), "sandbox denied") {
+		t.Fatalf("expected turn.failed error, got %v", err)
+	}
+}
+
+func TestCodexRunPassesSandboxFlags(t *testing.T) {
+	// The fake CLI echoes its argv; the degraded summary must show the
+	// sandbox/git flags that make implement-task handoffs actually work.
+	cli := fakeCLI(t, `echo "ARGV:$*"`)
+	t.Setenv("SB_CODEX_BIN", cli)
+	res, err := CodexRun(cliEnv(), func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--skip-git-repo-check", "--sandbox", "workspace-write"} {
+		if !strings.Contains(res.Summary, want) {
+			t.Fatalf("codex argv missing %q, summary:\n%s", want, res.Summary)
+		}
+	}
+}
+
+func TestCodexRunLongLineFailsLoudly(t *testing.T) {
+	// A single output line over the 1MB scanner token limit must fail,
+	// not silently truncate the stream into a partial result.
+	cli := fakeCLI(t, `head -c 1100000 /dev/zero | tr '\0' 'y'; echo`)
+	t.Setenv("SB_CODEX_BIN", cli)
+	if _, err := CodexRun(cliEnv(), func(string) {}); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("expected scanner-too-long error, got %v", err)
+	}
+}
+
 func TestOpencodeRunPlainText(t *testing.T) {
 	cli := fakeCLI(t, `echo 'opencode output here'`)
 	t.Setenv("SB_OPENCODE_BIN", cli)
@@ -101,8 +160,12 @@ func TestEchoRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(res.Summary, "Fix bug") || len(res.Artifacts) != 1 {
+	if !strings.Contains(res.Summary, "Fix bug") {
 		t.Fatalf("unexpected echo result: %+v", res)
+	}
+	// Echo performs no work, so it must not claim file refs as artifacts.
+	if len(res.Artifacts) != 0 {
+		t.Fatalf("echo must not claim artifacts, got %v", res.Artifacts)
 	}
 }
 
@@ -114,16 +177,28 @@ func TestEchoRunFailHook(t *testing.T) {
 }
 
 func TestParseAgentLine(t *testing.T) {
-	p, isRes, res := parseAgentLine([]byte(`{"type":"result","result":"done!"}`))
-	if !isRes || res != "done!" || p != "" {
-		t.Fatalf("result parse failed: %q %v %q", p, isRes, res)
+	p := parseAgentLine([]byte(`{"type":"result","result":"done!"}`))
+	if !p.isResult || p.resultText != "done!" || p.progress != "" {
+		t.Fatalf("result parse failed: %+v", p)
 	}
-	p, isRes, _ = parseAgentLine([]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}`))
-	if isRes || p != "hi" {
-		t.Fatalf("assistant parse failed: %q %v", p, isRes)
+	p = parseAgentLine([]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}`))
+	if p.isResult || p.progress != "hi" {
+		t.Fatalf("assistant parse failed: %+v", p)
 	}
-	p, isRes, _ = parseAgentLine([]byte(`not json`))
-	if p != "" || isRes {
-		t.Fatalf("non-JSON should yield nothing: %q %v", p, isRes)
+	p = parseAgentLine([]byte(`not json`))
+	if p.progress != "" || p.isResult || p.isError {
+		t.Fatalf("non-JSON should yield nothing: %+v", p)
+	}
+	p = parseAgentLine([]byte(`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"codex answer"}}`))
+	if !p.isResult || p.resultText != "codex answer" {
+		t.Fatalf("codex agent_message parse failed: %+v", p)
+	}
+	p = parseAgentLine([]byte(`{"type":"turn.failed","error":{"message":"sandbox denied"}}`))
+	if !p.isError || p.errorText != "sandbox denied" {
+		t.Fatalf("codex turn.failed parse failed: %+v", p)
+	}
+	p = parseAgentLine([]byte(`{"type":"thread.started","thread_id":"t1"}`))
+	if p.progress != "" || p.isResult || p.isError {
+		t.Fatalf("thread.started should be ignored: %+v", p)
 	}
 }

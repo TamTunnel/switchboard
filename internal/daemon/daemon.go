@@ -7,6 +7,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -31,7 +32,13 @@ type Daemon struct {
 	log    *slog.Logger
 	mu     sync.Mutex
 	active map[string]bool // envelope ids currently being processed
+	wg     sync.WaitGroup  // in-flight dispatches; Run waits for these on shutdown
 }
+
+// shutdownWait bounds how long Run waits for in-flight dispatches after
+// shutdown is requested. Dispatches are killed via context cancellation, so
+// they finish quickly; the bound is a backstop against a stuck store write.
+const shutdownWait = 30 * time.Second
 
 // New creates a daemon rooted at home (e.g. ~/.switchboard).
 func New(home string, cfg config.Config, log *slog.Logger) (*Daemon, error) {
@@ -91,19 +98,41 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	t := time.NewTicker(poll)
 	defer t.Stop()
+	d.poll(ctx) // dispatch immediately; don't wait a full interval after start
 	for {
 		select {
 		case <-ctx.Done():
+			d.waitForInflight()
 			return nil
 		case <-t.C:
-			d.poll()
+			d.poll(ctx)
 		}
+	}
+}
+
+// waitForInflight waits for in-flight dispatches to finish (their adapter
+// processes are killed by context cancellation, so they fail into a retry
+// or dead-letter rather than being orphaned), bounded by shutdownWait.
+func (d *Daemon) waitForInflight() {
+	done := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		d.log.Info("shutdown: in-flight dispatches finished")
+	case <-time.After(shutdownWait):
+		d.log.Warn("shutdown: timed out waiting for in-flight dispatches, exiting anyway")
 	}
 }
 
 // rebuildIndex scans the store at startup. Duplicate ids (possible if the
 // daemon crashed mid-move) resolve by scan order: dead > done > claimed >
 // pending — the furthest-along copy wins, and the others are removed.
+// Envelopes stranded in claimed/ (a previous daemon died mid-dispatch) are
+// requeued to pending/ with their attempt count preserved: a retry must
+// survive a restart, never silently vanish.
 func (d *Daemon) rebuildIndex() {
 	seen := map[string]string{}
 	for _, dir := range []string{store.DirDead, store.DirDone, store.DirClaimed, store.DirPending} {
@@ -123,10 +152,20 @@ func (d *Daemon) rebuildIndex() {
 			}
 		}
 	}
+	if stranded, err := d.store.List(store.DirClaimed); err == nil {
+		for _, env := range stranded {
+			// The winner of dedupe above is the only copy left; anything
+			// still in claimed/ was in flight when the old daemon died.
+			d.log.Info("requeueing stranded envelope", "id", env.ID, "attempts", env.Attempts)
+			if err := d.store.Move(env, envelope.StatusPending); err != nil {
+				d.log.Error("requeue stranded envelope failed", "id", env.ID, "err", err)
+			}
+		}
+	}
 	d.log.Info("index rebuilt", "envelopes", len(seen))
 }
 
-func (d *Daemon) poll() {
+func (d *Daemon) poll(ctx context.Context) {
 	pending, err := d.store.List(store.DirPending)
 	if err != nil {
 		d.log.Error("poll: list pending", "err", err)
@@ -143,16 +182,18 @@ func (d *Daemon) poll() {
 		}
 		d.active[env.ID] = true
 		d.mu.Unlock()
-		go d.dispatch(env)
+		d.wg.Add(1)
+		go d.dispatch(ctx, env)
 	}
 }
 
-func (d *Daemon) dispatch(env *envelope.Envelope) {
+func (d *Daemon) dispatch(ctx context.Context, env *envelope.Envelope) {
+	defer d.wg.Done()
 	defer func() {
 		if rec := recover(); rec != nil {
 			d.log.Error("dispatch panicked, dead-lettering", "id", env.ID, "panic", rec)
-			env.Status = envelope.StatusDead
 			env.Error = fmt.Sprintf("daemon: internal panic: %v", rec)
+			// Move sets Status itself; do not pre-mutate it (see Move's doc).
 			_ = d.store.Move(env, envelope.StatusDead)
 		}
 		d.mu.Lock()
@@ -188,10 +229,12 @@ func (d *Daemon) dispatch(env *envelope.Envelope) {
 			_ = d.store.AppendLog(env.ID, text)
 		},
 	}
-	ctx := context.Background()
 	res, err := runner.Run(ctx, env)
 	if err != nil {
-		d.fail(env, err.Error(), true)
+		// A protocol mismatch is deterministic: retrying against the same
+		// adapter cannot succeed, so it must not burn the one retry.
+		retryable := !errors.Is(err, adapter.ErrProtocolMismatch)
+		d.fail(env, err.Error(), retryable)
 		return
 	}
 	if res.Degraded {
@@ -206,12 +249,14 @@ func (d *Daemon) dispatch(env *envelope.Envelope) {
 }
 
 // fail records a failure: one retry (back to pending) or dead-letter.
+// It must NOT set env.Status before Move: Move computes the old directory
+// from the current status, and a pre-mutated status leaves a stale copy of
+// the envelope behind in claimed/.
 func (d *Daemon) fail(env *envelope.Envelope, msg string, retryable bool) {
 	env.Error = msg
 	_ = d.store.AppendLog(env.ID, "failed: "+msg)
 	if retryable && env.Attempts < 2 {
 		d.log.Info("envelope failed, retrying once", "id", env.ID, "attempts", env.Attempts)
-		env.Status = envelope.StatusPending
 		if err := d.store.Move(env, envelope.StatusPending); err != nil {
 			d.log.Error("fail: requeue failed", "id", env.ID, "err", err)
 		}
@@ -306,6 +351,8 @@ func (d *Daemon) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Bound the request body: an envelope is small text, never megabytes.
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	var env envelope.Envelope
 	if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
 		http.Error(w, "bad envelope: "+err.Error(), http.StatusBadRequest)
@@ -313,6 +360,13 @@ func (d *Daemon) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := env.Validate(); err != nil {
 		http.Error(w, "envelope failed validation: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Result notifications are created by the daemon itself (route writes
+	// them straight to done/). A client-sent result would land in pending/,
+	// where poll() skips it forever — reject it instead of stranding it.
+	if env.Kind == envelope.KindResult {
+		http.Error(w, "result envelopes are created by the daemon, not sent", http.StatusBadRequest)
 		return
 	}
 	env.Status = envelope.StatusPending
@@ -361,6 +415,10 @@ func (d *Daemon) handleStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing ?id=", http.StatusBadRequest)
 		return
 	}
+	if !envelope.ValidID(id) {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
 	env, _, err := d.store.ReadAny(id)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
@@ -374,6 +432,10 @@ func (d *Daemon) handleLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	if id == "" {
 		http.Error(w, "missing ?id=", http.StatusBadRequest)
+		return
+	}
+	if !envelope.ValidID(id) {
+		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
 	data, err := d.store.ReadLog(id)

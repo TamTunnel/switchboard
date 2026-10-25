@@ -16,6 +16,8 @@ import (
 // through parseAgentLine. Structured parsing failures degrade to raw text:
 // the returned summary is the terminal result when present, otherwise the
 // accumulated output. A non-zero exit with no usable output is an error.
+// A parsed terminal error (e.g. codex turn.failed) is an error even when
+// the CLI exits 0 — a failed turn must never look like a degraded success.
 func agentRun(argv []string, workdir string, progress func(string)) (*Result, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	if workdir != "" {
@@ -38,25 +40,48 @@ func agentRun(argv []string, workdir string, progress func(string)) (*Result, er
 		for sc.Scan() {
 			progress("stderr: " + sc.Text())
 		}
+		if err := sc.Err(); err != nil {
+			progress("stderr: scanner error: " + err.Error())
+		}
 	}()
 	var raw bytes.Buffer
+	rawTruncated := false
 	var resultText string
 	var haveResult bool
+	var errText string
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Bytes()
-		raw.Write(line)
-		raw.WriteByte('\n')
-		p, isRes, res := parseAgentLine(line)
-		if isRes {
+		if raw.Len() < maxAccumulatedBytes {
+			raw.Write(line)
+			raw.WriteByte('\n')
+			if raw.Len() >= maxAccumulatedBytes && !rawTruncated {
+				raw.WriteString("…[truncated: output exceeded 1MB]\n")
+				rawTruncated = true
+			}
+		}
+		parsed := parseAgentLine(line)
+		switch {
+		case parsed.isError:
+			errText = parsed.errorText
+		case parsed.isResult:
 			haveResult = true
-			resultText = res
-		} else if p != "" {
-			progress(p)
+			resultText = parsed.resultText
+		case parsed.progress != "":
+			progress(parsed.progress)
 		}
 	}
+	// A scanner error (e.g. a line over the 1MB token limit) means the
+	// stream is incomplete: fail loudly instead of trusting a partial read.
+	if err := sc.Err(); err != nil {
+		_ = cmd.Wait()
+		return nil, fmt.Errorf("%s: reading output: %w", argv[0], err)
+	}
 	waitErr := cmd.Wait()
+	if errText != "" {
+		return nil, fmt.Errorf("%s failed: %s", argv[0], errText)
+	}
 	if haveResult {
 		if resultText == "" {
 			resultText = strings.TrimSpace(raw.String())
@@ -90,11 +115,20 @@ func ClaudeRun(env *envelope.Envelope, progress func(string)) (*Result, error) {
 }
 
 // CodexRun runs Codex headless: `codex exec --json`. The prompt is passed as
-// an argument. Codex's JSON line schema is parsed best-effort (see
-// parseAgentLine); unparseable output degrades to raw text.
+// an argument. Two flags are load-bearing for handoffs, not optional:
+//   - --skip-git-repo-check: codex refuses to run outside a git repo by
+//     default, so non-repo workspaces would fail outright.
+//   - --sandbox workspace-write: the default sandbox is read-only, so an
+//     implement-task handoff could never write files. Workspace-write keeps
+//     writes inside the workspace; a denial outside it surfaces as a
+//     turn.failed error (see parseAgentLine), not a silent success.
+//
+// Codex's JSON line schema is parsed structurally (thread/item/turn events);
+// unparseable output degrades to raw text.
 func CodexRun(env *envelope.Envelope, progress func(string)) (*Result, error) {
 	prompt := BuildPrompt(env)
-	argv := []string{agentBin("SB_CODEX_BIN", "codex"), "exec", "--json", prompt}
+	argv := []string{agentBin("SB_CODEX_BIN", "codex"), "exec", "--json",
+		"--skip-git-repo-check", "--sandbox", "workspace-write", prompt}
 	return agentRun(argv, env.Context.Workspace, progress)
 }
 
@@ -108,7 +142,9 @@ func OpencodeRun(env *envelope.Envelope, progress func(string)) (*Result, error)
 }
 
 // EchoRun is the reference adapter: it performs no agent work, it just
-// acknowledges the envelope. Integration tests run the daemon against it.
+// acknowledges the envelope. It claims no artifacts: echo produces nothing,
+// so reporting the envelope's file refs as artifacts would be false.
+// Integration tests run the daemon against it.
 //
 // Test hooks (env vars, never set in production):
 //
@@ -124,7 +160,6 @@ func EchoRun(env *envelope.Envelope, progress func(string)) (*Result, error) {
 	}
 	progress(fmt.Sprintf("echo: received task %q", env.Task.Title))
 	return &Result{
-		Summary:   fmt.Sprintf("echo: %s — instructions received (%d chars)", env.Task.Title, len(env.Task.Instructions)),
-		Artifacts: env.Context.Files,
+		Summary: fmt.Sprintf("echo: %s — instructions received (%d chars)", env.Task.Title, len(env.Task.Instructions)),
 	}, nil
 }

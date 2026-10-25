@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/TamTunnel/switchboard/internal/envelope"
 )
@@ -19,14 +20,15 @@ type Client struct {
 	http *http.Client
 }
 
-// New dials the daemon socket at sockPath.
+// New dials the daemon socket at sockPath. The client timeout bounds every
+// call: without it, a hung daemon would hang the CLI forever.
 func New(sockPath string) *Client {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
 		},
 	}
-	return &Client{http: &http.Client{Transport: transport}}
+	return &Client{http: &http.Client{Transport: transport, Timeout: 30 * time.Second}}
 }
 
 // Health checks the daemon is up.
