@@ -1,0 +1,6 @@
+# Switchboard build artifacts
+/switchboard
+/sb
+/sb-adapter
+*.log
+/dist/

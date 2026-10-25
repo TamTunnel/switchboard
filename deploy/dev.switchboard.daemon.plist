@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.switchboard.daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<!-- Adjust this path to where you installed the binary. -->
+		<string>/usr/local/bin/switchboard</string>
+		<string>daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/switchboard.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/switchboard.log</string>
+</dict>
+</plist>

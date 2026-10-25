@@ -1,0 +1,15 @@
+[Unit]
+Description=Switchboard daemon — local-first task bus for coding agents
+After=network.target
+
+[Service]
+Type=simple
+# Adjust this path to where you installed the binary.
+ExecStart=/usr/local/bin/switchboard daemon
+Restart=on-failure
+RestartSec=5
+# The daemon only needs its home directory and a Unix socket inside it.
+# No network listener exists, so no firewall rules are involved.
+
+[Install]
+WantedBy=default.target
