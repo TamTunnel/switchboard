@@ -1,4 +1,4 @@
-// Command sb is the Switchboard CLI: send, inbox, status, logs.
+// Command sb is the Switchboard CLI: send, inbox, status, logs, dead.
 // Any agent with shell access hands off by running `sb send` — no plugin or
 // MCP integration is needed to start.
 package main
@@ -99,6 +99,17 @@ func main() {
 			if shape != envelope.ShapeReview && diffFile != "" {
 				return fmt.Errorf("--diff-file only applies to --shape review (shape is %q)", shape)
 			}
+			if hasControlRune(from) {
+				return fmt.Errorf("--from must not contain control characters or newlines")
+			}
+			for _, n := range next {
+				if n == "" {
+					return fmt.Errorf("--next must not be empty (an empty hop silently kills a pipeline)")
+				}
+			}
+			if len(next) > 64 {
+				return fmt.Errorf("--next is capped at 64 stages, got %d", len(next))
+			}
 			if instrFile != "" {
 				data, err := os.ReadFile(instrFile)
 				if err != nil {
@@ -106,10 +117,15 @@ func main() {
 				}
 				instr = string(data)
 			} else if instr == "" {
-				// No --instructions: read stdin (lets agents pipe task text).
-				data, err := io.ReadAll(os.Stdin)
+				// No --instructions: read stdin (lets agents pipe task text),
+				// capped: an unbounded read would sail past the daemon's
+				// send cap and fail there with a worse error.
+				data, err := io.ReadAll(io.LimitReader(os.Stdin, maxStdinInstructions+1))
 				if err != nil {
 					return err
+				}
+				if len(data) > maxStdinInstructions {
+					return fmt.Errorf("instructions from stdin exceed 1MB; use --instructions-file and split the task")
 				}
 				instr = strings.TrimSpace(string(data))
 			}
@@ -220,6 +236,26 @@ func main() {
 		},
 	}
 
+	deadCmd := &cobra.Command{
+		Use:   "dead",
+		Short: "List dead-lettered envelopes (failed tasks and why)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c := newClient(homeDir(homeFlag))
+			envs, err := c.Dead()
+			if err != nil {
+				return err
+			}
+			if len(envs) == 0 {
+				fmt.Println("(no dead letters)")
+				return nil
+			}
+			for _, e := range envs {
+				fmt.Printf("%s  %-8s  %-12s  %s  —  %s\n", e.ID, e.From, e.To, e.Task.Title, firstLine(e.Error))
+			}
+			return nil
+		},
+	}
+
 	versionCmd := &cobra.Command{
 		Use:   "version",
 		Short: "Print version",
@@ -230,7 +266,7 @@ func main() {
 
 	root := &cobra.Command{Use: "sb"}
 	root.PersistentFlags().StringVar(&homeFlag, "home", "", "switchboard home directory (default $SWITCHBOARD_HOME or ~/.switchboard)")
-	root.AddCommand(sendCmd, inboxCmd, statusCmd, logsCmd, versionCmd)
+	root.AddCommand(sendCmd, inboxCmd, statusCmd, logsCmd, deadCmd, versionCmd)
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -242,3 +278,20 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// hasControlRune reports whether s contains a control character (including
+// newlines). Agent names must be single-line display strings: a newline in
+// --from would otherwise land inside rendered prompts and log lines.
+func hasControlRune(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// maxStdinInstructions caps instructions read from stdin, matching the
+// daemon's /v1/send body cap: unbounded stdin reads let a piped multi-MB
+// blob through to a daemon that must reject it anyway.
+const maxStdinInstructions = 1 << 20

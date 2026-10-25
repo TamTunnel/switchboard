@@ -77,13 +77,37 @@ Free-form status text. The daemon appends it to the envelope's run log
   result whose summary is that text. The daemon logs the degradation.
 - **Non-zero exit with no result line** is a failure, even if text was printed.
 - **Timeout**: the daemon kills the adapter's whole process group. Adapters
-  must not assume they get a graceful shutdown.
+  must not assume they get a graceful shutdown. Escape hatch, disclosed:
+  a child that escapes its process group (e.g. via setsid or daemonizing
+  itself) survives the kill and keeps running after the daemon considers
+  the run dead. Cgroup supervision that would close this hole is out of
+  v1 scope.
+
+## Size limits (normative)
+
+These are the real ceilings, not aspirations — sends beyond them are
+rejected at `/v1/send` instead of failing later:
+
+- Envelope body: 1MB.
+- Rendered prompt handed to an agent CLI: 128KB (agent CLIs take the
+  prompt as a single argv element; Linux caps one argument at 128KB).
+- One NDJSON line on the daemon↔adapter wire: 8MB (a 1MB envelope
+  re-encoded as JSON can grow ~6x when every byte needs escaping).
+- Adapter stdout/stderr lines: 1MB each (overlong lines fail loudly).
+- Accumulated adapter output kept as a degraded summary: 1MB.
+- Pipeline stages (`next`): 64.
+- Transcript excerpt carried into each next stage: ~8000 characters.
+- Per-envelope run log: 10MB.
 
 ## Security — read this before writing an adapter
 
-1. **Provenance on every envelope.** The daemon stamps who sent the task.
-   Surface it to the receiving agent (the reference prompt builder includes a
-   provenance block).
+1. **Provenance on every envelope — sender-asserted, not verified.**
+   `from` is whatever the sending process claimed; the daemon records it
+   verbatim and does not verify it. Any local process as the same user
+   can send as any agent name. Surface provenance to the receiving agent
+   (the reference prompt builder includes a provenance block with the
+   sender on its own sanitized line), but display it as an assertion, not
+   as a verified identity: it is not a trust signal.
 2. **Handoffs are an injection surface.** Instructions arrive from another
    agent, which may itself have been manipulated. Receiving agents must
    treat handoff instructions as **DATA, not as trusted system
@@ -97,7 +121,12 @@ Free-form status text. The daemon appends it to the envelope's run log
 4. **Same-machine trust boundary.** File refs are exact paths and the daemon
    runs as the user. There is no multi-user auth in v1 because there is no
    network surface to authenticate — filesystem permissions on
-   `~/.switchboard` are the boundary.
+   `~/.switchboard` are the boundary. Concretely: any process running as
+   the same user can use the socket, send as any agent, and read any
+   envelope. What the daemon does enforce: envelope ids are unique (a
+   resend of an existing id is rejected with 409, so a replay cannot
+   double-run a task), and only one daemon may hold a home at a time (a
+   lock file makes a second daemon fail fast).
 
 ## Envelope versioning
 
@@ -112,7 +141,7 @@ protocol with its own hello negotiation — never a silent extension.
 |---|---|---|---|
 | echo | — (built in) | structured | Reference adapter. Used by all integration tests. |
 | claude | `claude -p --output-format stream-json [--resume <id>] <prompt>` | Structured `stream-json` parsing; raw-text fallback on parse failure | Implemented against Claude Code's documented flags. Not live-tested here (no Claude Code CLI in the build environment); unit-tested against scripted stand-ins emitting the documented format. |
-| codex | `codex exec --json --skip-git-repo-check --sandbox workspace-write <prompt>` | Structured `codex exec --json` parsing (thread/item/turn events): `item.completed` + `agent_message` is the result, `turn.failed` is an error (never a degraded success); raw-text fallback on parse failure | Implemented against Codex's documented flags. Not live-tested here (no Codex CLI in the build environment); unit-tested against scripted stand-ins emitting the documented format. |
+| codex | `codex exec --json --skip-git-repo-check --sandbox workspace-write <prompt>` | Structured `codex exec --json` parsing (thread/item/turn events): `item.completed` + `agent_message` is the result, `turn.failed` is an error (never a degraded success); raw-text fallback on parse failure | Implemented against Codex's documented flags. Not live-tested here (no Codex CLI in the build environment); unit-tested against scripted stand-ins emitting the documented format. Known failure mode: an approval prompt can hang a non-interactive exec until the daemon timeout fires, then one retry, then dead-letter. |
 | opencode | `opencode run <prompt>` | Plain text (no stable JSON mode pinned) | Provisional. If OpenCode gains a stable JSON streaming mode, pin it here and upgrade the parser. |
 
 Override the CLI binary per adapter with `SB_CLAUDE_BIN`, `SB_CODEX_BIN`,

@@ -5,9 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/TamTunnel/switchboard/internal/envelope"
 )
+
+// maxWireLineBytes caps one NDJSON line on the daemon↔adapter wire. It must
+// exceed the worst-case run-request line: a 1MB send-cap envelope re-encoded
+// as JSON can grow ~6x when every byte needs escaping, so 8MB leaves
+// headroom. Adapter stdout lines keep their own 1MB scanner cap in the
+// runner — this cap is only for the run request the daemon sends in.
+const maxWireLineBytes = 8 << 20
 
 // RunFunc is an adapter's implementation: given an envelope, report progress
 // and return a result (or an error). It runs in the adapter process.
@@ -19,7 +27,15 @@ type RunFunc func(env *envelope.Envelope, progress func(string)) (*Result, error
 // go to stderr.
 func Serve(agent string, capabilities []string, run RunFunc) int {
 	w := bufio.NewWriter(os.Stdout)
+	// emit is called from the main thread (hello/result) AND from
+	// goroutines the run function spawns (progress via agent-CLI stderr
+	// scanners). A shared bufio.Writer is not safe for concurrent use —
+	// without this mutex, a stderr progress line and the result JSON
+	// interleave mid-line and corrupt the wire. One mutex, one writer.
+	var emitMu sync.Mutex
 	emit := func(v any) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
 		data, _ := json.Marshal(v)
 		w.Write(data)
 		w.WriteByte('\n')
@@ -28,7 +44,7 @@ func Serve(agent string, capabilities []string, run RunFunc) int {
 	emit(Hello{Type: MsgHello, Protocol: ProtocolVersion, Agent: agent, Capabilities: capabilities})
 
 	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	sc.Buffer(make([]byte, 64*1024), maxWireLineBytes)
 	if !sc.Scan() {
 		if err := sc.Err(); err != nil {
 			// A scanner error (e.g. a run request line over the 1MB token

@@ -141,3 +141,31 @@ func TestListSkipsCorrupt(t *testing.T) {
 		t.Fatalf("corrupt file should be skipped, got %d err %v", len(list), err)
 	}
 }
+
+func TestListSkipsNonULIDAndMismatched(t *testing.T) {
+	// F20: a store-planted file must never surface an id that callers
+	// turn into a filesystem path. Skipped: non-ULID content id, and a
+	// valid ULID content id under a different filename.
+	st := testStore(t)
+	good := testEnv()
+	if err := st.Write(good); err != nil {
+		t.Fatal(err)
+	}
+	// Content id is not a ULID, filename is arbitrary.
+	_ = os.WriteFile(filepath.Join(st.Root(), DirPending, "planted.json"),
+		[]byte(`{"version":"sb/1","id":"../../evil","from":"a","to":"b","shape":"delegate","task":{"title":"T","instructions":"I"},"status":"pending"}`), 0o600)
+	// Content id is a valid ULID, but the filename does not match it.
+	other := envelope.NewULID()
+	_ = os.WriteFile(filepath.Join(st.Root(), DirPending, "mismatch.json"),
+		[]byte(`{"version":"sb/1","id":"`+other+`","from":"a","to":"b","shape":"delegate","task":{"title":"T","instructions":"I"},"status":"pending"}`), 0o600)
+	// Half-written temp file from an interrupted atomic write.
+	_ = os.WriteFile(filepath.Join(st.Root(), DirPending, ".tmp-123456.json"),
+		[]byte(`{"version":"sb/1","id":"`+good.ID+`","from":"a","to":"b","shape":"delegate","task":{"title":"T","instructions":"I"},"status":"pending"}`), 0o600)
+	list, err := st.List(DirPending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ID != good.ID {
+		t.Fatalf("expected only the legitimate envelope, got %d", len(list))
+	}
+}

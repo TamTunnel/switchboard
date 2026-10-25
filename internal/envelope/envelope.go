@@ -97,11 +97,19 @@ type Envelope struct {
 	ReplyTo string `json:"reply_to,omitempty"`
 	// Provenance is a human-readable statement of who sent this envelope.
 	// Receivers display it; it is not a trust signal.
-	Provenance string  `json:"provenance,omitempty"`
-	Result     *Result `json:"result,omitempty"`
-	Error      string  `json:"error,omitempty"`
-	CreatedAt  string  `json:"created_at,omitempty"`
-	UpdatedAt  string  `json:"updated_at,omitempty"`
+	Provenance string `json:"provenance,omitempty"`
+	// AdapterPid/AdapterPgid record the adapter process (group leader) the
+	// daemon started for this envelope's current run. On restart, the
+	// daemon SIGKILLs the recorded group before requeueing a stranded
+	// claimed envelope, so the retry never overlaps an orphaned adapter.
+	// Best-effort only: cleared when the run ends, and useless if the
+	// adapter escaped its process group (setsid) or the pid was reused.
+	AdapterPid  int     `json:"adapter_pid,omitempty"`
+	AdapterPgid int     `json:"adapter_pgid,omitempty"`
+	Result      *Result `json:"result,omitempty"`
+	Error       string  `json:"error,omitempty"`
+	CreatedAt   string  `json:"created_at,omitempty"`
+	UpdatedAt   string  `json:"updated_at,omitempty"`
 }
 
 // ulidPattern mirrors the "id" pattern in the sb/1 JSON Schema. Store paths
@@ -185,7 +193,7 @@ const envelopeSchema = `{
   "properties": {
     "version": {"const": "sb/1"},
     "id": {"type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"},
-    "from": {"type": "string", "minLength": 1},
+    "from": {"type": "string", "minLength": 1, "pattern": "^[^[:cntrl:]]+$"},
     "to": {"type": "string", "minLength": 1},
     "shape": {"enum": ["delegate", "pipeline", "review"]},
     "kind": {"enum": ["task", "result"]},
@@ -197,7 +205,7 @@ const envelopeSchema = `{
         "instructions": {"type": "string", "minLength": 1},
         "done_criteria": {"type": "array", "items": {"type": "string"}},
         "constraints": {"type": "object", "properties": {
-          "timeout_seconds": {"type": "integer", "minimum": 1}
+          "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}
         }}
       }
     },
@@ -211,7 +219,7 @@ const envelopeSchema = `{
     }},
     "status": {"enum": ["pending", "claimed", "running", "done", "failed", "dead"]},
     "attempts": {"type": "integer", "minimum": 0},
-    "next": {"type": "array", "items": {"type": "string"}},
+    "next": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 64},
     "origin": {"type": "string"},
     "reply_to": {"type": "string"},
     "provenance": {"type": "string"},

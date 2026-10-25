@@ -83,6 +83,24 @@ func (c *Client) Inbox(agent string) ([]*envelope.Envelope, error) {
 	return out, nil
 }
 
+// Dead lists dead-lettered envelopes (the operator view of failures).
+func (c *Client) Dead() ([]*envelope.Envelope, error) {
+	resp, err := c.http.Get("http://switchboard/v1/dead")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("dead: %s", string(body))
+	}
+	var out []*envelope.Envelope
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Status fetches one envelope by id.
 func (c *Client) Status(id string) (*envelope.Envelope, error) {
 	resp, err := c.http.Get("http://switchboard/v1/status?id=" + url.QueryEscape(id))

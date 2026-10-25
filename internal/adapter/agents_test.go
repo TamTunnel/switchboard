@@ -169,13 +169,6 @@ func TestEchoRun(t *testing.T) {
 	}
 }
 
-func TestEchoRunFailHook(t *testing.T) {
-	t.Setenv("SB_ECHO_FAIL", "1")
-	if _, err := EchoRun(cliEnv(), func(string) {}); err == nil {
-		t.Fatal("expected SB_ECHO_FAIL to produce an error")
-	}
-}
-
 func TestParseAgentLine(t *testing.T) {
 	p := parseAgentLine([]byte(`{"type":"result","result":"done!"}`))
 	if !p.isResult || p.resultText != "done!" || p.progress != "" {
@@ -200,5 +193,32 @@ func TestParseAgentLine(t *testing.T) {
 	p = parseAgentLine([]byte(`{"type":"thread.started","thread_id":"t1"}`))
 	if p.progress != "" || p.isResult || p.isError {
 		t.Fatalf("thread.started should be ignored: %+v", p)
+	}
+}
+
+func TestAgentRunNULByteErrorDoesNotBlameMissingBinary(t *testing.T) {
+	// F16: a NUL byte in the prompt makes exec fail, but the old message
+	// blamed a missing CLI ("is the agent CLI installed?") — a
+	// misdiagnosis. Only a genuinely missing binary earns that hint.
+	cli := fakeCLI(t, `echo hi`)
+	t.Setenv("SB_CLAUDE_BIN", cli)
+	env := cliEnv()
+	env.Task.Instructions = "bad\x00instructions"
+	_, err := ClaudeRun(env, func(string) {})
+	if err == nil {
+		t.Fatal("expected error for NUL byte in prompt")
+	}
+	if strings.Contains(err.Error(), "is the agent CLI installed?") {
+		t.Fatalf("NUL-byte error must not blame a missing CLI: %v", err)
+	}
+}
+
+func TestAgentRunMissingBinaryKeepsInstallHint(t *testing.T) {
+	// Positive control for F16: a genuinely missing binary still gets
+	// the install hint.
+	t.Setenv("SB_CLAUDE_BIN", "/nonexistent/agent-cli-binary")
+	_, err := ClaudeRun(cliEnv(), func(string) {})
+	if err == nil || !strings.Contains(err.Error(), "is the agent CLI installed?") {
+		t.Fatalf("missing binary should keep install hint, got: %v", err)
 	}
 }

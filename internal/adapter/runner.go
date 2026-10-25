@@ -122,6 +122,11 @@ type Runner struct {
 	Timeout time.Duration
 	// OnProgress receives progress text lines (for logging).
 	OnProgress func(text string)
+	// OnStart, if set, fires after the adapter process starts with its pid
+	// and process-group id (equal: the adapter is a group leader). The
+	// daemon records these in the claimed envelope so a later restart can
+	// kill the group before requeueing, instead of double-executing.
+	OnStart func(pid, pgid int)
 }
 
 // Run executes the adapter for env and returns its result. The adapter process
@@ -156,6 +161,9 @@ func (r *Runner) Run(ctx context.Context, env *envelope.Envelope) (*Result, erro
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("adapter: start %v: %w", r.Command, err)
+	}
+	if r.OnStart != nil {
+		r.OnStart(cmd.Process.Pid, cmd.Process.Pid) // group leader: pgid == pid
 	}
 	// Kill the whole process group on context expiry (CommandContext only
 	// kills the direct child). The killDone guard stops the goroutine from

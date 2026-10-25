@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/TamTunnel/switchboard/internal/envelope"
 )
@@ -164,6 +165,11 @@ func (s *Store) ReadAny(id string) (*envelope.Envelope, string, error) {
 }
 
 // List returns all envelopes in a directory, newest first by CreatedAt.
+// Files are skipped unless BOTH the filename stem and the envelope id
+// inside are valid ULIDs and identical: a store-planted file with a
+// crafted id must never reach callers that build filesystem paths from
+// ids (e.g. rebuildIndex's dedupe removal), and half-written temp files
+// (".tmp-*.json") never match either.
 func (s *Store) List(dir string) ([]*envelope.Envelope, error) {
 	entries, err := os.ReadDir(filepath.Join(s.root, dir))
 	if err != nil {
@@ -181,6 +187,10 @@ func (s *Store) List(dir string) ([]*envelope.Envelope, error) {
 		var env envelope.Envelope
 		if err := json.Unmarshal(data, &env); err != nil {
 			continue // skip corrupt files; daemon logs them at startup
+		}
+		stem := strings.TrimSuffix(e.Name(), ".json")
+		if !envelope.ValidID(env.ID) || stem != env.ID {
+			continue // planted or half-written file: never trust its id
 		}
 		out = append(out, &env)
 	}

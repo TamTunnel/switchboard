@@ -3,7 +3,9 @@ package adapter
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"strings"
@@ -32,7 +34,16 @@ func agentRun(argv []string, workdir string, progress func(string)) (*Result, er
 		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("run %s: %w (is the agent CLI installed?)", argv[0], err)
+		// Only a missing binary earns the install hint: PATH lookup
+		// (exec.ErrNotFound) or an absolute path that does not exist
+		// (ENOENT). Other start failures (e.g. a NUL byte in an argv
+		// element, EINVAL) must not blame a missing CLI — that
+		// misdiagnosis sends the operator to reinstall a binary that
+		// is fine.
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("run %s: %w (is the agent CLI installed?)", argv[0], err)
+		}
+		return nil, fmt.Errorf("run %s: %w", argv[0], err)
 	}
 	go func() {
 		sc := bufio.NewScanner(stderr)
@@ -146,16 +157,19 @@ func OpencodeRun(env *envelope.Envelope, progress func(string)) (*Result, error)
 // so reporting the envelope's file refs as artifacts would be false.
 // Integration tests run the daemon against it.
 //
-// Test hooks (env vars, never set in production):
+// Test hooks (env vars) — ONLY honored in builds with the
+// `switchboardtesthooks` build tag (see echo_hooks*.go). Shipped binaries
+// ignore them: an operator's stray SB_ECHO_FAIL=1 must never fail echo
+// runs in production.
 //
 //	SB_ECHO_FAIL=1  -> report an error instead of a result.
 //	SB_ECHO_HANG=1  -> sleep forever (daemon timeout tests).
 func EchoRun(env *envelope.Envelope, progress func(string)) (*Result, error) {
-	if os.Getenv("SB_ECHO_HANG") == "1" {
+	if echoHooksEnabled() && os.Getenv("SB_ECHO_HANG") == "1" {
 		progress("echo: hanging (test hook)")
 		time.Sleep(24 * time.Hour)
 	}
-	if os.Getenv("SB_ECHO_FAIL") == "1" {
+	if echoHooksEnabled() && os.Getenv("SB_ECHO_FAIL") == "1" {
 		return nil, fmt.Errorf("echo: intentional failure (test hook)")
 	}
 	progress(fmt.Sprintf("echo: received task %q", env.Task.Title))

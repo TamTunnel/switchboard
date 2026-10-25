@@ -41,8 +41,15 @@ default_agent: alice
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Agents) != 1 || cfg.Agents["myagent"].Command[0] != "my-adapter" {
-		t.Fatalf("override failed: %+v", cfg.Agents)
+	// F21: file agents MERGE over the built-ins — a config with one custom
+	// agent must not silently drop echo/claude/codex/opencode.
+	if len(cfg.Agents) != 5 || cfg.Agents["myagent"].Command[0] != "my-adapter" {
+		t.Fatalf("merge failed: %+v", cfg.Agents)
+	}
+	for _, builtin := range []string{"echo", "claude", "codex", "opencode"} {
+		if _, ok := cfg.Agents[builtin]; !ok {
+			t.Fatalf("built-in agent %q lost after merge", builtin)
+		}
 	}
 	if cfg.PollIntervalMs != 100 || cfg.DefaultTimeoutS != 60 || cfg.DefaultAgent != "alice" {
 		t.Fatalf("scalar overrides failed: %+v", cfg)

@@ -23,7 +23,13 @@ type Config struct {
 	PollIntervalMs  int              `yaml:"poll_interval_ms"`
 	DefaultTimeoutS int              `yaml:"default_timeout_seconds"`
 	DefaultAgent    string           `yaml:"default_agent"`
+	// MaxInFlight caps concurrent adapter dispatches; excess envelopes
+	// stay pending. Zero means the default (4).
+	MaxInFlight int `yaml:"max_in_flight"`
 }
+
+// DefaultMaxInFlight is the worker-pool size when the config does not set one.
+const DefaultMaxInFlight = 4
 
 // Default returns the built-in configuration.
 func Default() Config {
@@ -36,6 +42,7 @@ func Default() Config {
 		},
 		PollIntervalMs:  500,
 		DefaultTimeoutS: 600,
+		MaxInFlight:     DefaultMaxInFlight,
 	}
 }
 
@@ -53,14 +60,22 @@ func Load(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &file); err != nil {
 		return cfg, err
 	}
+	// File agents MERGE over the built-ins: a config with one custom agent
+	// used to silently drop echo/claude/codex/opencode. Overriding a
+	// built-in name replaces just that agent.
 	if len(file.Agents) > 0 {
-		cfg.Agents = file.Agents
+		for name, agent := range file.Agents {
+			cfg.Agents[name] = agent
+		}
 	}
 	if file.PollIntervalMs > 0 {
 		cfg.PollIntervalMs = file.PollIntervalMs
 	}
 	if file.DefaultTimeoutS > 0 {
 		cfg.DefaultTimeoutS = file.DefaultTimeoutS
+	}
+	if file.MaxInFlight > 0 {
+		cfg.MaxInFlight = file.MaxInFlight
 	}
 	if file.DefaultAgent != "" {
 		cfg.DefaultAgent = file.DefaultAgent
