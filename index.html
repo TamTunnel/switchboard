@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switchboard — a local task bus for coding agents</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:820px;margin:0 auto;padding:24px 16px;line-height:1.55;color:#1a1a1a}
+h1{font-size:1.9em;line-height:1.2} h2{margin-top:2em;border-bottom:1px solid #ddd;padding-bottom:4px}
+pre{background:#111;color:#e8e8e8;padding:14px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.45}
+code{background:#f0f0f0;padding:1px 5px;border-radius:4px} pre code{background:none;padding:0}
+.cmd{color:#7dd87d} .dim{color:#999}
+.box{border:1px solid #d4a017;background:#fff8e1;padding:14px 18px;border-radius:8px}
+.box h3{margin-top:0}
+.flow{font-size:1.15em;text-align:center;margin:1em 0}
+a{color:#0b5cad}
+table{border-collapse:collapse;width:100%} td,th{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}
+video{width:100%;border-radius:8px;background:#000}
+.note{color:#555;font-size:.92em}
+</style>
+</head>
+<body>
+<h1>Switchboard</h1>
+<p><strong>A local task bus for coding agents.</strong> Think of it like email for
+agents: any agent with shell access can send a task to any other agent with one
+command, and the result comes back to the sender's inbox. No central server, no
+account, no cloud — everything lives on your machine, in plain files you can read.</p>
+<p><a href="https://github.com/TamTunnel/switchboard">Source on GitHub</a> ·
+<a href="#demo">Live demo walkthrough</a> ·
+<a href="#video">Explainer video</a> ·
+Apache-2.0</p>
+
+<h2>The problem</h2>
+<p>You run more than one coding agent — Claude Code in one terminal, Codex in
+another, OpenCode somewhere else. Sooner or later you want one of them to hand work
+to another: "you've explored the codebase, now have the other agent implement the
+fix," or "review this diff before I merge."</p>
+<p>Today that handoff is <em>you</em>. You copy context out of one terminal, paste it
+into another, re-explain the task, and hope nothing got lost. The agents can't talk
+to each other, so you become the bus — a slow, lossy, human-shaped one.</p>
+
+<h2>The solution, in plain terms</h2>
+<pre><code><span class="cmd"># From any agent's terminal: hand a task to another agent</span>
+sb send --to codex --title "Implement rate limiting" \
+  --instructions "Add per-key rate limiting to the API. See NOTES.md for the design."
+
+<span class="cmd"># Later, check what came back</span>
+sb inbox</code></pre>
+<p>A daemon owns the queue. Tasks are <strong>sb/1 envelopes</strong> — a title, markdown
+instructions, done-criteria, constraints, context refs, and provenance (who sent it) —
+stored as plain JSON in a maildir store under <code>~/.switchboard/</code>:</p>
+<p class="flow">pending/ &rarr; claimed/ &rarr; done/ &nbsp;&nbsp;·&nbsp;&nbsp; failures &rarr; dead/</p>
+<p>The daemon serves a local API on a <strong>Unix socket only</strong> (0600, no network
+listener in v1). Adapters are separate processes speaking versioned NDJSON over stdio;
+the built-ins cover <code>echo</code>, <code>claude</code>, <code>codex</code>, and
+<code>opencode</code>, and anyone can implement the adapter protocol.</p>
+
+<h2 id="demo">Demo walkthrough — real output, echo adapter</h2>
+<p class="note">This walkthrough was run against the real Switchboard binary (built from the
+repo) with the built-in <code>echo</code> reference adapter. IDs, timestamps, and
+outputs below are verbatim from that run. The real-agent adapters are covered in
+<a href="#limits">Honest limits</a> below.</p>
+
+<h3>Shape 1: delegate — A &rarr; B, result returns to A</h3>
+<pre><code><span class="cmd">$ sb send --to echo --title "Hello from the bus" \
+    --instructions "Say hello back, and confirm which agent you are."</span>
+01M5TSA2XAWVWMQ7AFT4JB6ATQ
+
+<span class="cmd">$ sb inbox</span>
+01M5TSA5D5V7YZ7GYGECSHTXTQ  result  done  echo  Hello from the bus  —  echo: Hello from the bus — instructions received (48 chars)
+
+<span class="cmd">$ sb logs 01M5TSA2XAWVWMQ7AFT4JB6ATQ</span>
+echo: received task "Hello from the bus"</code></pre>
+
+<h3>The envelope — everything about a task, in one JSON file</h3>
+<pre><code>{
+  "version": "sb/1",
+  "id": "01M5TSA2XAWVWMQ7AFT4JB6ATQ",
+  "from": "cli",
+  "to": "echo",
+  "shape": "delegate",
+  "kind": "task",
+  "task": {
+    "title": "Hello from the bus",
+    "instructions": "Say hello back, and confirm which agent you are.",
+    "constraints": {}
+  },
+  "context": { "workspace": "/home/hatch" },
+  "status": "done",
+  "attempts": 1,
+  "origin": "cli",
+  "provenance": "sent by agent cli",
+  "result": {
+    "summary": "echo: Hello from the bus — instructions received (48 chars)"
+  },
+  "created_at": "2026-10-26T00:21:04Z",
+  "updated_at": "2026-10-26T00:21:07Z"
+}</code></pre>
+<p>The result comes back as its own envelope (<code>kind: "result"</code>,
+<code>reply_to</code> pointing at the task) in the sender's inbox — the "email, not
+Slack" play.</p>
+
+<h3>Shape 2: pipeline — A &rarr; B &rarr; C, final result returns to A</h3>
+<pre><code><span class="cmd">$ sb send --to echo --shape pipeline --next echo \
+    --title "Two-hop pipeline" \
+    --instructions "First hop: draft a one-line greeting. Second hop: repeat it back with a suffix."</span>
+01M5TSAC9RZAJX9W93SCFNWEF1
+
+<span class="cmd">$ sb status 01M5TSAC9RZAJX9W93SCFNWEF1</span>
+{
+  "version": "sb/1",
+  "id": "01M5TSAC9RZAJX9W93SCFNWEF1",
+  "shape": "pipeline",
+  "status": "done",
+  "attempts": 1,
+  "next": [ "echo" ],
+  "result": {
+    "summary": "echo: Two-hop pipeline — instructions received (79 chars)"
+  }
+}</code></pre>
+
+<h3>Shape 3: review — B reviews A's diff, comments return to A</h3>
+<pre><code><span class="cmd">$ sb send --to echo --shape review --diff-file changes.diff \
+    --title "Review this diff" --instructions "Focus on security issues."</span>
+01M5TSAK5NMEK8YGEZ0FQ5DWTY
+
+<span class="cmd">$ sb status 01M5TSAK5NMEK8YGEZ0FQ5DWTY</span>
+{
+  "version": "sb/1",
+  "id": "01M5TSAK5NMEK8YGEZ0FQ5DWTY",
+  "shape": "review",
+  "status": "done",
+  "context": {
+    "diff": "diff --git a/auth.go b/auth.go\n--- a/auth.go\n+++ b/auth.go\n@@ -12,7 +12,7 @@\n func CheckToken(tok string) bool {\n-\tif tok == \"letmein\" {\n+\tif subtle.ConstantTimeCompare([]byte(tok), []byte(expectedToken)) == 1 {"
+  },
+  "result": {
+    "summary": "echo: Review this diff — instructions received (25 chars)"
+  }
+}</code></pre>
+
+<h3>End of run — the maildir tells the story</h3>
+<pre><code><span class="cmd">$ for d in pending claimed done dead; do echo "$d: $(ls ~/$d | wc -l) files"; done
+$ sb dead</span>
+pending: 0 files
+claimed: 0 files
+done: 7 files
+dead: 0 files
+(no dead letters)</code></pre>
+<p>Three tasks sent, three results in the inbox, nothing stranded, nothing silently
+dropped. When something does fail, it goes to <code>dead/</code> with the error
+attached — and the origin agent gets a failure notification in its inbox.</p>
+
+<h2>All three handoff shapes</h2>
+<table>
+<tr><th>Shape</th><th>Flow</th><th>Command</th></tr>
+<tr><td>Delegate</td><td>A &rarr; B, result returns to A</td><td><code>sb send --to codex --title "Fix the flaky test" …</code></td></tr>
+<tr><td>Pipeline</td><td>A &rarr; B &rarr; C, final result returns to A</td><td><code>sb send --to claude --shape pipeline --next codex --next opencode …</code></td></tr>
+<tr><td>Review</td><td>B reviews A's diff, comments return to A</td><td><code>sb send --to claude --shape review --diff-file changes.diff …</code></td></tr>
+</table>
+<p>Routing is explicit: <code>--to</code> takes an agent name, or a capability tag like
+<code>--to cap:review</code> (first agent declaring that capability wins). No model
+picks the agent for you.</p>
+
+<h2 id="limits">Honest limits</h2>
+<div class="box">
+<h3>What this demo does — and does not — prove</h3>
+<ul>
+<li><strong>Demo uses the echo reference adapter.</strong> The claude, codex, and
+opencode adapters are implemented against their CLIs' documented flags and unit-tested
+against scripted stand-ins emitting the documented formats. None has been live-tested
+against the real CLI in this project's build environment. Known Codex failure mode,
+named plainly: an approval prompt can hang a non-interactive <code>codex exec</code>
+until the daemon timeout fires, then one retry, then dead-letter.</li>
+<li><strong>Task-level handoff only.</strong> v1 translates a structured task spec +
+file refs + transcript excerpt into the target agent's prompt. Full-fidelity
+portability between agent session formats is post-v1 and is not claimed anywhere.</li>
+<li><strong>Local only.</strong> Same machine, same workspace. Network/remote agents are
+explicitly out of scope for v1. The Unix socket is the only identity boundary:
+<code>From</code> is sender-asserted, not daemon-verified — provenance is a display
+string, not a trust signal, and receiving agents are told to treat handoff
+instructions as data from an untrusted peer.</li>
+<li><strong>Setsid escape.</strong> An adapter that escapes its process group (e.g. via
+setsid/daemonization) cannot be killed on daemon restart or shutdown; cgroup
+supervision that would close that hole is out of v1 scope.</li>
+<li><strong>Size limits.</strong> 1MB per envelope, 128KB rendered prompt, pipelines
+capped at 64 stages, transcript excerpts at ~8000 characters. Oversized sends are
+rejected immediately with a clear error.</li>
+</ul>
+</div>
+
+<h2 id="video">Explainer video</h2>
+<video controls preload="metadata" src="explainer.mp4">
+Your browser does not support the video tag.
+</video>
+<p class="note">Short captioned explainer: the problem, the idea, the envelope, and the three
+handoff shapes — with the honest limits above.</p>
+
+<h2>Try it</h2>
+<pre><code><span class="cmd"># Build (Go 1.23+, static binaries, no runtime to install)</span>
+git clone https://github.com/TamTunnel/switchboard
+cd switchboard
+CGO_ENABLED=0 go build -o /usr/local/bin/switchboard ./cmd/switchboard
+CGO_ENABLED=0 go build -o /usr/local/bin/sb ./cmd/sb
+CGO_ENABLED=0 go build -o /usr/local/bin/sb-adapter ./cmd/sb-adapter
+
+<span class="cmd"># Terminal 1: start the daemon (it owns the queue)</span>
+switchboard daemon
+
+<span class="cmd"># Terminal 2: send a task, then check results</span>
+sb send --to echo --title "Hello" --instructions "Say hello back."
+sb inbox          <span class="dim"># results land here</span>
+sb status &lt;id&gt;    <span class="dim"># full envelope as JSON</span>
+sb logs &lt;id&gt;      <span class="dim"># adapter run log</span>
+sb dead           <span class="dim"># dead-lettered envelopes and why they failed</span></code></pre>
+<p>Keep it running with the systemd unit or launchd plist in
+<code>deploy/</code>. See the README for architecture, the adapter protocol, and the
+full FAQ.</p>
+
+<hr>
+<p class="note">Switchboard is open source under Apache-2.0.
+<a href="https://github.com/TamTunnel/switchboard">TamTunnel/switchboard</a> ·
+Demo built from the repo's own CLI output; sample task content is illustrative.</p>
+</body>
+</html>
