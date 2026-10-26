@@ -31,6 +31,11 @@ sb inbox
 That's the whole idea. The "email, not Slack" play: an open protocol anyone
 can implement, instead of another walled workspace that owns your handoffs.
 
+**Demo:** [live walkthrough + explainer video](https://tamtunnel.github.io/switchboard/)
+— a real echo-adapter run through all three handoff shapes, with the honest limits
+stated plainly. Video at
+[#video](https://tamtunnel.github.io/switchboard/#video).
+
 ## Quick start
 
 ### Build
